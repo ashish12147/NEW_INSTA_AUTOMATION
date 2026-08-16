@@ -1,0 +1,250 @@
+#!/usr/bin/env python3
+"""@44.o0 Instagram Reels automation.
+
+A standalone Railway service for a second Instagram account.  It intentionally
+shares no database, Telegram bot, schedule, posting history, or environment
+variables with any other automation.
+"""
+from __future__ import annotations
+
+import contextlib
+import csv
+import datetime as dt
+import hashlib
+import json
+import logging
+import mimetypes
+import os
+import re
+import shutil
+import signal
+import sqlite3
+import subprocess
+import tempfile
+import threading
+import time
+import traceback
+import urllib.parse
+import zipfile
+from dataclasses import dataclass
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from pathlib import Path, PurePosixPath
+from typing import Any, Iterable, Optional
+from zoneinfo import ZoneInfo
+
+import requests
+
+from content import build_caption
+
+APP_NAME = "44.o0 Reels Automation"
+APP_VERSION = "1.0.0"
+TIMEZONE_NAME = os.getenv("AUTOMATION_TIMEZONE", "Asia/Kolkata").strip() or "Asia/Kolkata"
+TZ = ZoneInfo(TIMEZONE_NAME)
+POST_TIMES_RAW = os.getenv("REEL_POST_TIMES", "13:00,20:30")
+POST_TIMES = tuple(x.strip() for x in POST_TIMES_RAW.split(",") if x.strip())
+MAX_ATTEMPTS = max(1, int(os.getenv("MAX_ATTEMPTS", "3")))
+SCHEDULE_GRACE_MINUTES = max(1, int(os.getenv("SCHEDULE_GRACE_MINUTES", "15")))
+BACKUP_INTERVAL_HOURS = max(1, int(os.getenv("BACKUP_INTERVAL_HOURS", "48")))
+ANALYTICS_DELAY_HOURS = max(1, int(os.getenv("ANALYTICS_DELAY_HOURS", "72")))
+ANALYTICS_RETRY_HOURS = max(1, int(os.getenv("ANALYTICS_RETRY_HOURS", "6")))
+API_VERSION = os.getenv("INSTAGRAM_API_VERSION", "v25.0").strip().lstrip("/")
+GRAPH_BASE = f"https://graph.instagram.com/{API_VERSION}"
+SHARE_TO_FEED = os.getenv("INSTAGRAM_SHARE_TO_FEED", "true").lower() in {"1", "true", "yes", "on"}
+PORT = int(os.getenv("PORT", "8080"))
+
+DRIVE_FOLDER_ID = os.getenv("DRIVE_FOLDER_ID", "").strip()
+INSTAGRAM_USER_ID = os.getenv("INSTAGRAM_USER_ID", "").strip()
+INSTAGRAM_ACCESS_TOKEN = os.getenv("INSTAGRAM_ACCESS_TOKEN", "").strip()
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_OWNER_ID = os.getenv("TELEGRAM_OWNER_ID", "").strip() or os.getenv("TELEGRAM_CHAT_ID", "").strip()
+PUBLIC_BASE_URL = os.getenv("PUBLIC_BASE_URL", "").strip().rstrip("/")
+if not PUBLIC_BASE_URL and os.getenv("RAILWAY_PUBLIC_DOMAIN"):
+    PUBLIC_BASE_URL = "https://" + os.getenv("RAILWAY_PUBLIC_DOMAIN", "").strip().strip("/")
+
+DATA_DIR = Path(os.getenv("REELS_DATA_DIR", "").strip() or os.getenv("RAILWAY_VOLUME_MOUNT_PATH", "").strip() or "/data")
+DB_PATH = Path(os.getenv("REELS_DB_PATH", str(DATA_DIR / "44o0_state.sqlite3")))
+TEMP_DIR = Path(os.getenv("REELS_TEMP_DIR", str(DATA_DIR / "tmp")))
+
+HTTP = requests.Session()
+HTTP.headers.update({"User-Agent": f"44o0-Reels-Automation/{APP_VERSION}"})
+STOP_EVENT = threading.Event()
+POST_LOCK = threading.Lock()
+PUBLIC_FILES_LOCK = threading.Lock()
+PUBLIC_FILES: dict[str, Path] = {}
+SAFE_HALT_REASON = ""
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+LOG = logging.getLogger("44o0")
+
+ALLOWED_EXTENSIONS = {".mp4", ".mov"}
+VIDEO_MAX_BYTES = 1_000_000_000
+
+
+# ----------------------------- General helpers -----------------------------
+
+def now_utc() -> dt.datetime:
+    return dt.datetime.now(dt.timezone.utc)
+
+
+def now_local() -> dt.datetime:
+    return now_utc().astimezone(TZ)
+
+
+def iso(value: Optional[dt.datetime] = None) -> str:
+    return (value or now_utc()).astimezone(dt.timezone.utc).isoformat(timespec="seconds")
+
+
+def parse_iso(value: Optional[str]) -> Optional[dt.datetime]:
+    if not value:
+        return None
+    try:
+        out = dt.datetime.fromisoformat(value)
+        if out.tzinfo is None:
+            out = out.replace(tzinfo=dt.timezone.utc)
+        return out.astimezone(dt.timezone.utc)
+    except ValueError:
+        return None
+
+
+def short_error(exc: BaseException | str, limit: int = 900) -> str:
+    text = str(exc)
+    if INSTAGRAM_ACCESS_TOKEN:
+        text = text.replace(INSTAGRAM_ACCESS_TOKEN, "<redacted>")
+    if TELEGRAM_BOT_TOKEN:
+        text = text.replace(TELEGRAM_BOT_TOKEN, "<redacted>")
+    text = re.sub(r"(?i)(access_token=)[^&\s]+", r"\1<redacted>", text)
+    return text[:limit]
+
+
+def natural_parts(value: str) -> tuple[Any, ...]:
+    parts: list[Any] = []
+    for token in re.split(r"(\d+)", value.casefold()):
+        if token.isdigit():
+            parts.append((0, int(token)))
+        else:
+            parts.append((1, token))
+    return tuple(parts)
+
+
+def validate_times() -> None:
+    if len(POST_TIMES) != 2:
+        raise RuntimeError("REEL_POST_TIMES must contain exactly two HH:MM values for this automation")
+    for value in POST_TIMES:
+        dt.datetime.strptime(value, "%H:%M")
+
+
+def required_config_missing() -> list[str]:
+    values = {
+        "DRIVE_FOLDER_ID": DRIVE_FOLDER_ID,
+        "INSTAGRAM_USER_ID": INSTAGRAM_USER_ID,
+        "INSTAGRAM_ACCESS_TOKEN": INSTAGRAM_ACCESS_TOKEN,
+        "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+        "TELEGRAM_OWNER_ID": TELEGRAM_OWNER_ID,
+        "PUBLIC_BASE_URL": PUBLIC_BASE_URL,
+    }
+    return [key for key, value in values.items() if not value]
+
+
+# ----------------------------- SQLite -----------------------------
+
+def connect() -> sqlite3.Connection:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    DB_PATH.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA synchronous=FULL")
+    conn.execute("PRAGMA foreign_keys=ON")
+    return conn
+
+
+def init_db() -> None:
+    existed = DB_PATH.exists()
+    conn = connect()
+    try:
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS reels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                file_id TEXT NOT NULL UNIQUE,
+                folder_path TEXT NOT NULL,
+                filename TEXT NOT NULL,
+                drive_url TEXT NOT NULL,
+                order_index INTEGER NOT NULL UNIQUE,
+                status TEXT NOT NULL DEFAULT 'PENDING',
+                attempts INTEGER NOT NULL DEFAULT 0,
+                caption TEXT,
+                caption_strategy TEXT,
+                caption_key TEXT,
+                hashtag_pack TEXT,
+                container_id TEXT,
+                media_id TEXT,
+                permalink TEXT,
+                last_error TEXT,
+                discovered_at TEXT NOT NULL,
+                last_attempt_at TEXT,
+                posted_at TEXT,
+                analytics_due_at TEXT,
+                analytics_collected_at TEXT,
+                analytics_attempts INTEGER NOT NULL DEFAULT 0,
+                analytics_next_retry_at TEXT,
+                analytics_error TEXT,
+                views INTEGER,
+                reach INTEGER,
+                likes INTEGER,
+                comments INTEGER,
+                shares INTEGER,
+                saved INTEGER,
+                follows INTEGER,
+                avg_watch_time REAL,
+                total_watch_time REAL,
+                updated_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_reels_status_order ON reels(status, order_index);
+            CREATE INDEX IF NOT EXISTS idx_reels_analytics_due ON reels(analytics_due_at, analytics_collected_at);
+
+            CREATE TABLE IF NOT EXISTS events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                event_type TEXT NOT NULL,
+                status TEXT NOT NULL,
+                reel_id INTEGER,
+                detail TEXT,
+                created_at TEXT NOT NULL
+            );
+            CREATE INDEX IF NOT EXISTS idx_events_created ON events(created_at);
+
+            CREATE TABLE IF NOT EXISTS schedule_slots (
+                slot_key TEXT PRIMARY KEY,
+                claimed_at TEXT NOT NULL
+            );
+            """
+        )
+        check = conn.execute("PRAGMA integrity_check").fetchone()[0]
+        if str(check).lower() != "ok":
+            raise RuntimeError(f"SQLite integrity check failed: {check}")
+        conn.commit()
+        if not existed:
+            set_meta_conn(conn, "database_created_at", iso())
+    finally:
+        conn.close()
+
+
+def set_meta_conn(conn: sqlite3.Connection, key: str, value: str) -> None:
+    conn.execute(
+        """
+        INSERT INTO meta(key,value,updated_at) VALUES(?,?,?)
+        ON CONFLICT(key) DO UPDATE SET value=excluded.value, updated_at=excluded.updated_at
+        """,
+        (key, value, iso()),
+    )
+    conn.commit()
+
