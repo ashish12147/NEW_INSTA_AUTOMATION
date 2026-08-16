@@ -1,0 +1,250 @@
+def mark_attempt_started(reel_id: int) -> int:
+    conn = connect()
+    try:
+        conn.execute(
+            """
+            UPDATE reels SET status='PROCESSING', attempts=attempts+1,
+              last_attempt_at=?, last_error=NULL, updated_at=? WHERE id=?
+            """,
+            (iso(), iso(), reel_id),
+        )
+        conn.commit()
+        return int(conn.execute("SELECT attempts FROM reels WHERE id=?", (reel_id,)).fetchone()[0])
+    finally:
+        conn.close()
+
+
+def mark_retry_or_failed(reel_id: int, error: str) -> str:
+    conn = connect()
+    try:
+        attempts = int(conn.execute("SELECT attempts FROM reels WHERE id=?", (reel_id,)).fetchone()[0])
+        status = "FAILED" if attempts >= MAX_ATTEMPTS else "PENDING"
+        conn.execute(
+            "UPDATE reels SET status=?, last_error=?, updated_at=? WHERE id=?",
+            (status, short_error(error), iso(), reel_id),
+        )
+        conn.commit()
+        return status
+    finally:
+        conn.close()
+
+
+def mark_container_id(reel_id: int, container_id: str) -> None:
+    conn = connect()
+    try:
+        conn.execute("UPDATE reels SET container_id=?, updated_at=? WHERE id=?", (container_id, iso(), reel_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_publishing(reel_id: int) -> None:
+    conn = connect()
+    try:
+        conn.execute("UPDATE reels SET status='PUBLISHING', updated_at=? WHERE id=?", (iso(), reel_id))
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_uncertain(reel_id: int, error: str) -> None:
+    conn = connect()
+    try:
+        conn.execute(
+            "UPDATE reels SET status='UNCERTAIN', last_error=?, updated_at=? WHERE id=?",
+            (short_error(error), iso(), reel_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def mark_posted(reel_id: int, media_id: str, permalink: str) -> None:
+    posted = now_utc()
+    due = posted + dt.timedelta(hours=ANALYTICS_DELAY_HOURS)
+    conn = connect()
+    try:
+        conn.execute(
+            """
+            UPDATE reels SET status='POSTED', media_id=?, permalink=?, last_error=NULL,
+              posted_at=?, analytics_due_at=?, updated_at=? WHERE id=?
+            """,
+            (media_id, permalink, iso(posted), iso(due), iso(), reel_id),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def perform_post_locked(trigger: str) -> None:
+    row = get_next_reel()
+    if row is None:
+        send_message("QUEUE EMPTY\nNo eligible pending Reel remains.")
+        log_event("post", "EMPTY", detail=f"trigger={trigger}")
+        return
+
+    reel_id = int(row["id"])
+    filename = str(row["filename"])
+    folder = str(row["folder_path"])
+    caption = str(row["caption"] or "")
+    log_event("post", "START", reel_id, f"trigger={trigger}; {folder}/{filename}")
+
+    while True:
+        current = get_reel(reel_id)
+        if current is None:
+            return
+        if int(current["attempts"]) >= MAX_ATTEMPTS:
+            if str(current["status"]) != "FAILED":
+                mark_retry_or_failed(reel_id, str(current["last_error"] or "Maximum attempts reached"))
+            return
+
+        attempt = mark_attempt_started(reel_id)
+        path: Optional[Path] = None
+        public_token = ""
+        try:
+            path = download_reel(current)
+            public_token, video_url = register_public_file(path)
+            log_event("download", "OK", reel_id, f"attempt={attempt}; bytes={path.stat().st_size}")
+
+            container_id = create_container(video_url, caption)
+            mark_container_id(reel_id, container_id)
+            log_event("container", "CREATED", reel_id, f"container={container_id}")
+            poll_container(container_id)
+            log_event("container", "FINISHED", reel_id, f"container={container_id}")
+
+            mark_publishing(reel_id)
+            try:
+                media_id = publish_container(container_id)
+            except AmbiguousPublishError as exc:
+                mark_uncertain(reel_id, str(exc))
+                log_event("post", "UNCERTAIN", reel_id, str(exc))
+                send_message(
+                    "UNCERTAIN PUBLISH\n"
+                    f"Reel ID: {reel_id}\n"
+                    f"File: {folder}/{filename}\n"
+                    f"Attempt: {attempt}/{MAX_ATTEMPTS}\n"
+                    f"Reason: {short_error(exc)}\n\n"
+                    "Automatic retry is BLOCKED to prevent a duplicate."
+                )
+                return
+
+            permalink = get_permalink(media_id)
+            mark_posted(reel_id, media_id, permalink)
+            log_event("post", "POSTED", reel_id, f"media_id={media_id}; trigger={trigger}")
+            report = (
+                "REEL POSTED\n"
+                f"Reel ID: {reel_id}\n"
+                f"Folder: {folder}\n"
+                f"File: {filename}\n"
+                f"Attempt: {attempt}/{MAX_ATTEMPTS}\n"
+                f"Caption mode: {current['caption_strategy']}\n"
+                f"Hashtags: {current['hashtag_pack']}\n"
+                f"Instagram media ID: {media_id}"
+            )
+            if permalink:
+                report += f"\n{permalink}"
+            send_message(report)
+            return
+
+        except Exception as exc:
+            # If status is already UNCERTAIN, never overwrite it.
+            latest = get_reel(reel_id)
+            if latest and str(latest["status"]) == "UNCERTAIN":
+                return
+            status = mark_retry_or_failed(reel_id, str(exc))
+            log_event("post", status, reel_id, f"attempt={attempt}; {short_error(exc)}")
+            if status == "FAILED":
+                send_message(
+                    "REEL FAILED — SKIPPED AFTER 3 ATTEMPTS\n"
+                    f"Reel ID: {reel_id}\n"
+                    f"Folder: {folder}\n"
+                    f"File: {filename}\n"
+                    f"Attempts: {attempt}/{MAX_ATTEMPTS}\n"
+                    f"Reason: {short_error(exc)}\n\n"
+                    "It is now in the persistent Failed list. The next scheduled post will continue with the next Reel."
+                )
+                return
+            send_message(
+                "REEL ATTEMPT FAILED — RETRYING\n"
+                f"Reel ID: {reel_id}\nFile: {filename}\n"
+                f"Attempt: {attempt}/{MAX_ATTEMPTS}\nReason: {short_error(exc)}"
+            )
+            # Short bounded backoff. Attempts are persisted, so a restart does
+            # not reset the retry counter.
+            delay = 20 if attempt == 1 else 60
+            STOP_EVENT.wait(delay)
+            if STOP_EVENT.is_set():
+                return
+        finally:
+            if public_token:
+                unregister_public_file(public_token)
+            if path is not None:
+                path.unlink(missing_ok=True)
+
+
+def _post_worker(trigger: str) -> None:
+    try:
+        perform_post_locked(trigger)
+    except Exception as exc:
+        log_event("post_worker", "ERROR", detail=traceback.format_exc())
+        send_message("POST WORKER ERROR\n" + short_error(exc))
+    finally:
+        POST_LOCK.release()
+
+
+def start_post_job(trigger: str) -> bool:
+    if SAFE_HALT_REASON:
+        send_message("POSTING BLOCKED\n" + SAFE_HALT_REASON)
+        return False
+    if not POST_LOCK.acquire(blocking=False):
+        return False
+    threading.Thread(target=_post_worker, args=(trigger,), name="post", daemon=True).start()
+    return True
+
+
+def claim_slot(slot_key: str) -> bool:
+    conn = connect()
+    try:
+        try:
+            conn.execute("INSERT INTO schedule_slots(slot_key,claimed_at) VALUES(?,?)", (slot_key, iso()))
+            conn.commit()
+            return True
+        except sqlite3.IntegrityError:
+            return False
+    finally:
+        conn.close()
+
+
+def slot_claimed(slot_key: str) -> bool:
+    conn = connect()
+    try:
+        return bool(conn.execute("SELECT 1 FROM schedule_slots WHERE slot_key=?", (slot_key,)).fetchone())
+    finally:
+        conn.close()
+
+
+def is_paused() -> bool:
+    return get_meta("paused", "0") == "1"
+
+
+def due_schedule_slot() -> Optional[str]:
+    if is_paused() or SAFE_HALT_REASON:
+        return None
+    now = now_local()
+    for value in POST_TIMES:
+        hh, mm = map(int, value.split(":"))
+        scheduled = dt.datetime.combine(now.date(), dt.time(hh, mm), TZ)
+        age = now - scheduled
+        if dt.timedelta(0) <= age <= dt.timedelta(minutes=SCHEDULE_GRACE_MINUTES):
+            key = scheduled.strftime("%Y-%m-%d %H:%M")
+            if not slot_claimed(key):
+                return key
+    return None
+
+
+def next_scheduled_time() -> Optional[dt.datetime]:
+    if is_paused():
+        return None
+    now = now_local()
+    for add_days in range(0, 8):
+        day = now.date() + dt.timedelta(days=add_days)
