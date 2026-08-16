@@ -1,0 +1,181 @@
+    elif data == "show:status":
+        send_message(status_text())
+    elif data == "show:next":
+        send_message(next_text())
+    elif data == "show:queue":
+        send_message(queue_text())
+    elif data == "show:failed":
+        send_message(list_status_text("FAILED"))
+    elif data == "show:skipped":
+        send_message(list_status_text("SKIPPED"))
+    elif data == "show:uncertain":
+        send_message(list_status_text("UNCERTAIN"))
+    elif data == "show:stats":
+        send_message(stats_text())
+    elif data == "show:top":
+        send_message(top_text())
+    elif data == "show:config":
+        send_message(config_text())
+    elif data == "show:health":
+        send_message(health_text())
+    elif data == "show:logs":
+        send_message(logs_text("all"))
+    elif data == "show:logs_today":
+        send_message(logs_text("today"))
+    elif data == "show:logs_posted":
+        send_message(logs_text("posted"))
+    elif data == "show:logs_failed":
+        send_message(logs_text("failed"))
+    elif data == "show:logs_errors":
+        send_message(logs_text("errors"))
+    elif data == "show:logs_uncertain":
+        send_message(logs_text("uncertain"))
+    elif data == "show:backup_status":
+        send_message(backup_status_text())
+
+
+def telegram_loop() -> None:
+    if not TELEGRAM_BOT_TOKEN:
+        return
+    tg_api("deleteWebhook", data={"drop_pending_updates": "false"})
+    offset = int(get_meta("telegram_offset", "0") or 0)
+    while not STOP_EVENT.is_set():
+        result = tg_api(
+            "getUpdates",
+            data={"timeout": "25", "offset": str(offset), "allowed_updates": json.dumps(["message", "callback_query"])},
+            timeout=35,
+        )
+        updates = result.get("result", []) if isinstance(result, dict) else []
+        if not isinstance(updates, list):
+            STOP_EVENT.wait(3)
+            continue
+        for update in updates:
+            try:
+                update_id = int(update.get("update_id", 0))
+                offset = max(offset, update_id + 1)
+                set_meta("telegram_offset", str(offset))
+
+                message = update.get("message")
+                if isinstance(message, dict):
+                    sender = str((message.get("from") or {}).get("id") or "")
+                    if sender != TELEGRAM_OWNER_ID:
+                        continue
+                    text = str(message.get("text") or "")
+                    if text.startswith("/"):
+                        handle_command(text)
+                    continue
+
+                callback = update.get("callback_query")
+                if isinstance(callback, dict):
+                    sender = str((callback.get("from") or {}).get("id") or "")
+                    if sender != TELEGRAM_OWNER_ID:
+                        answer_callback(str(callback.get("id") or ""))
+                        continue
+                    handle_callback(str(callback.get("data") or ""), str(callback.get("id") or ""))
+            except Exception:
+                log_event("telegram", "ERROR", detail=traceback.format_exc())
+
+
+# ----------------------------- Scheduler -----------------------------
+def scheduler_loop() -> None:
+    while not STOP_EVENT.is_set():
+        try:
+            slot = due_schedule_slot()
+            if slot and not POST_LOCK.locked():
+                if claim_slot(slot):
+                    if not start_post_job(f"scheduled:{slot}"):
+                        # If the lock raced between checks, remove the claim so
+                        # the scheduler can retry within the grace window.
+                        conn = connect()
+                        conn.execute("DELETE FROM schedule_slots WHERE slot_key=?", (slot,))
+                        conn.commit()
+                        conn.close()
+
+            for row in due_analytics_rows(limit=1):
+                threading.Thread(target=collect_analytics, args=(row,), name="analytics", daemon=True).start()
+                break
+
+            if backup_due():
+                threading.Thread(target=backup_worker, name="backup", daemon=True).start()
+        except Exception:
+            log_event("scheduler", "ERROR", detail=traceback.format_exc())
+        STOP_EVENT.wait(15)
+
+
+# ----------------------------- Startup -----------------------------
+def startup() -> ThreadingHTTPServer:
+    global SAFE_HALT_REASON
+    validate_times()
+    init_db()
+    recover_interrupted_states()
+    removed = cleanup_temp_files()
+
+    if inventory_initialized():
+        conn = connect()
+        count = int(conn.execute("SELECT COUNT(*) FROM reels").fetchone()[0])
+        conn.close()
+        if count == 0:
+            raise RuntimeError("Inventory is marked initialized but the reels table is empty; refusing to start fresh")
+    else:
+        build_initial_inventory()
+
+    missing = required_config_missing()
+    if missing:
+        SAFE_HALT_REASON = "Missing required environment variable(s): " + ", ".join(missing)
+    else:
+        try:
+            _, username = verify_instagram()
+            if username != "44.o0":
+                SAFE_HALT_REASON = f"Token verified as @{username}, expected @44.o0"
+        except Exception as exc:
+            SAFE_HALT_REASON = "Instagram authentication check failed: " + short_error(exc)
+
+    server = start_http_server()
+    threading.Thread(target=telegram_loop, name="telegram", daemon=True).start()
+    threading.Thread(target=scheduler_loop, name="scheduler", daemon=True).start()
+
+    conn = connect()
+    total = int(conn.execute("SELECT COUNT(*) FROM reels").fetchone()[0])
+    pending = int(conn.execute("SELECT COUNT(*) FROM reels WHERE status='PENDING'").fetchone()[0])
+    conn.close()
+    log_event("startup", "SAFE_HALT" if SAFE_HALT_REASON else "OK", detail=f"inventory={total}; pending={pending}; temp_removed={removed}; {SAFE_HALT_REASON}")
+    send_message(
+        "SERVICE STARTED\n"
+        f"Account: @44.o0 ({INSTAGRAM_USER_ID})\n"
+        f"Version: {APP_VERSION}\n"
+        f"Database: OK\n"
+        f"Inventory: {total} Reels ({pending} pending)\n"
+        f"Temp cleanup: {removed} item(s) removed\n"
+        f"Scheduler: {', '.join(POST_TIMES)} IST\n"
+        f"State: {'SAFE HALT — '+SAFE_HALT_REASON if SAFE_HALT_REASON else 'READY'}"
+    )
+    return server
+
+
+def stop_signal(signum: int, _frame: Any) -> None:
+    LOG.info("Received signal %s; stopping", signum)
+    STOP_EVENT.set()
+
+
+def main() -> int:
+    signal.signal(signal.SIGTERM, stop_signal)
+    signal.signal(signal.SIGINT, stop_signal)
+    server: Optional[ThreadingHTTPServer] = None
+    try:
+        server = startup()
+        while not STOP_EVENT.wait(1):
+            pass
+        return 0
+    except Exception as exc:
+        LOG.exception("Startup failed")
+        with contextlib.suppress(Exception):
+            send_message("STARTUP FAILED\n" + short_error(exc))
+        return 1
+    finally:
+        if server is not None:
+            server.shutdown()
+            server.server_close()
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
