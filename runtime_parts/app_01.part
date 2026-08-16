@@ -1,0 +1,250 @@
+
+def set_meta(key: str, value: str) -> None:
+    conn = connect()
+    try:
+        set_meta_conn(conn, key, value)
+    finally:
+        conn.close()
+
+
+def get_meta(key: str, default: str = "") -> str:
+    conn = connect()
+    try:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (key,)).fetchone()
+        return str(row[0]) if row else default
+    finally:
+        conn.close()
+
+
+def log_event(event_type: str, status: str, reel_id: Optional[int] = None, detail: str = "") -> None:
+    detail = short_error(detail, 1800)
+    LOG.info("%s | %s | reel=%s | %s", event_type, status, reel_id or "-", detail)
+    conn = connect()
+    try:
+        conn.execute(
+            "INSERT INTO events(event_type,status,reel_id,detail,created_at) VALUES(?,?,?,?,?)",
+            (event_type, status.upper(), reel_id, detail, iso()),
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def recover_interrupted_states() -> None:
+    conn = connect()
+    try:
+        processing = conn.execute("SELECT COUNT(*) FROM reels WHERE status='PROCESSING'").fetchone()[0]
+        publishing = conn.execute("SELECT COUNT(*) FROM reels WHERE status='PUBLISHING'").fetchone()[0]
+        if processing:
+            conn.execute(
+                """
+                UPDATE reels SET status='PENDING',
+                  last_error='Recovered after service stopped before media_publish; safe to retry',
+                  updated_at=? WHERE status='PROCESSING'
+                """,
+                (iso(),),
+            )
+        if publishing:
+            conn.execute(
+                """
+                UPDATE reels SET status='UNCERTAIN',
+                  last_error='Service stopped while media_publish outcome was unknown; blocked from automatic retry',
+                  updated_at=? WHERE status='PUBLISHING'
+                """,
+                (iso(),),
+            )
+        conn.commit()
+    finally:
+        conn.close()
+    if processing:
+        log_event("startup_recovery", "RECOVERED", detail=f"Returned {processing} interrupted pre-publish Reel(s) to PENDING")
+    if publishing:
+        log_event("startup_recovery", "UNCERTAIN", detail=f"Blocked {publishing} interrupted publish Reel(s) as UNCERTAIN")
+
+
+# ----------------------------- Drive inventory -----------------------------
+@dataclass(frozen=True)
+class DriveItem:
+    file_id: str
+    folder_path: str
+    filename: str
+    drive_url: str
+
+
+def extract_drive_file_id(url: str) -> str:
+    for pattern in (
+        r"/d/([A-Za-z0-9_-]{10,})",
+        r"[?&]id=([A-Za-z0-9_-]{10,})",
+        r"/file/d/([A-Za-z0-9_-]{10,})",
+    ):
+        match = re.search(pattern, url)
+        if match:
+            return match.group(1)
+    return "url_" + hashlib.sha256(url.encode()).hexdigest()[:32]
+
+
+def run_gdown(args: list[str], timeout: int = 300) -> subprocess.CompletedProcess[str]:
+    binary = shutil.which("gdown")
+    if not binary:
+        raise RuntimeError("gdown is not installed")
+    return subprocess.run([binary, *args], text=True, capture_output=True, timeout=timeout, check=False)
+
+
+def scan_drive() -> list[DriveItem]:
+    folder_url = f"https://drive.google.com/drive/folders/{DRIVE_FOLDER_ID}"
+    proc = run_gdown([folder_url, "--folder", "--json", "--quiet"], timeout=420)
+    if proc.returncode != 0:
+        raise RuntimeError("Google Drive listing failed: " + short_error(proc.stderr or proc.stdout))
+    try:
+        entries = json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        raise RuntimeError("gdown returned invalid JSON while scanning the Drive folder") from exc
+    if not isinstance(entries, list):
+        raise RuntimeError("Unexpected Google Drive listing format")
+
+    raw: list[tuple[str, PurePosixPath]] = []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        url = str(entry.get("url") or "").strip()
+        path_text = str(entry.get("path") or "").strip().replace("\\", "/")
+        if not url or not path_text:
+            continue
+        path = PurePosixPath(path_text)
+        if path.suffix.lower() not in ALLOWED_EXTENSIONS:
+            continue
+        raw.append((url, path))
+    if not raw:
+        raise RuntimeError("No .mp4 or .mov files were found in the source Drive folder")
+
+    # gdown generally prefixes each path with the source folder name. Strip a
+    # common first component so folder ordering reflects the user's subfolders.
+    first_parts = {path.parts[0] for _, path in raw if path.parts}
+    strip_root = len(first_parts) == 1 and all(len(path.parts) >= 2 for _, path in raw)
+
+    items: list[DriveItem] = []
+    seen: set[str] = set()
+    for url, path in raw:
+        rel_parts = path.parts[1:] if strip_root else path.parts
+        rel = PurePosixPath(*rel_parts)
+        file_id = extract_drive_file_id(url)
+        if file_id in seen:
+            continue
+        seen.add(file_id)
+        folder = str(rel.parent) if str(rel.parent) not in {".", ""} else "(root)"
+        items.append(DriveItem(file_id=file_id, folder_path=folder, filename=rel.name, drive_url=url))
+
+    items.sort(
+        key=lambda item: (
+            tuple(natural_parts(part) for part in PurePosixPath(item.folder_path).parts),
+            natural_parts(item.filename),
+            item.file_id,
+        )
+    )
+    return items
+
+
+def inventory_initialized() -> bool:
+    return get_meta("inventory_initialized", "0") == "1"
+
+
+def build_initial_inventory() -> int:
+    items = scan_drive()
+    conn = connect()
+    try:
+        if conn.execute("SELECT COUNT(*) FROM reels").fetchone()[0] != 0:
+            raise RuntimeError("Initial inventory requested but reels table is not empty")
+        ts = iso()
+        for index, item in enumerate(items, start=1):
+            caption, strategy, caption_key, hashtag_pack = build_caption(index)
+            conn.execute(
+                """
+                INSERT INTO reels(
+                    file_id,folder_path,filename,drive_url,order_index,status,attempts,
+                    caption,caption_strategy,caption_key,hashtag_pack,discovered_at,updated_at
+                ) VALUES(?,?,?,?,?,'PENDING',0,?,?,?,?,?,?)
+                """,
+                (
+                    item.file_id,
+                    item.folder_path,
+                    item.filename,
+                    item.drive_url,
+                    index,
+                    caption,
+                    strategy,
+                    caption_key,
+                    hashtag_pack,
+                    ts,
+                    ts,
+                ),
+            )
+        set_meta_conn(conn, "inventory_initialized", "1")
+        set_meta_conn(conn, "inventory_source_count", str(len(items)))
+        set_meta_conn(conn, "inventory_last_scan_at", ts)
+        set_meta_conn(conn, "last_backup_at", ts)
+        conn.commit()
+    finally:
+        conn.close()
+    log_event("inventory", "CREATED", detail=f"Fixed initial inventory created with {len(items)} Reel(s)")
+    return len(items)
+
+
+def rescan_inventory() -> tuple[int, int]:
+    items = scan_drive()
+    conn = connect()
+    try:
+        existing_rows = conn.execute("SELECT file_id, order_index FROM reels").fetchall()
+        existing_ids = {str(row["file_id"]) for row in existing_rows}
+        next_index = int(conn.execute("SELECT COALESCE(MAX(order_index),0)+1 FROM reels").fetchone()[0])
+        added = 0
+        ts = iso()
+        for item in items:
+            if item.file_id in existing_ids:
+                continue
+            caption, strategy, caption_key, hashtag_pack = build_caption(next_index)
+            conn.execute(
+                """
+                INSERT INTO reels(
+                    file_id,folder_path,filename,drive_url,order_index,status,attempts,
+                    caption,caption_strategy,caption_key,hashtag_pack,discovered_at,updated_at
+                ) VALUES(?,?,?,?,?,'PENDING',0,?,?,?,?,?,?)
+                """,
+                (
+                    item.file_id,
+                    item.folder_path,
+                    item.filename,
+                    item.drive_url,
+                    next_index,
+                    caption,
+                    strategy,
+                    caption_key,
+                    hashtag_pack,
+                    ts,
+                    ts,
+                ),
+            )
+            added += 1
+            next_index += 1
+        set_meta_conn(conn, "inventory_last_scan_at", ts)
+        conn.commit()
+    finally:
+        conn.close()
+    log_event("inventory", "RESCAN", detail=f"Drive scan saw {len(items)} Reel(s); added {added} new Reel(s)")
+    return len(items), added
+
+
+def download_reel(row: sqlite3.Row) -> Path:
+    TEMP_DIR.mkdir(parents=True, exist_ok=True)
+    suffix = Path(str(row["filename"])).suffix.lower()
+    fd, name = tempfile.mkstemp(prefix=f"reel_{row['id']}_", suffix=suffix, dir=TEMP_DIR)
+    os.close(fd)
+    path = Path(name)
+    path.unlink(missing_ok=True)
+    proc = run_gdown([str(row["drive_url"]), "-O", str(path), "--quiet"], timeout=1200)
+    if proc.returncode != 0 or not path.exists():
+        path.unlink(missing_ok=True)
+        raise RuntimeError("Reel download failed: " + short_error(proc.stderr or proc.stdout))
+    size = path.stat().st_size
+    if size <= 0:
+        path.unlink(missing_ok=True)
+        raise RuntimeError("Downloaded Reel is empty")
