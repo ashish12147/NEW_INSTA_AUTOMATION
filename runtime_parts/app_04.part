@@ -1,0 +1,250 @@
+        for value in POST_TIMES:
+            hh, mm = map(int, value.split(":"))
+            candidate = dt.datetime.combine(day, dt.time(hh, mm), TZ)
+            if candidate > now:
+                return candidate
+    return None
+
+
+# ----------------------------- Analytics -----------------------------
+INSIGHT_METRICS = {
+    "views": "views",
+    "reach": "reach",
+    "likes": "likes",
+    "comments": "comments",
+    "shares": "shares",
+    "saved": "saved",
+    "follows": "follows",
+    "avg_watch_time": "ig_reels_avg_watch_time",
+    "total_watch_time": "ig_reels_video_view_total_time",
+}
+
+
+def parse_insight_value(payload: dict[str, Any]) -> Optional[float]:
+    data = payload.get("data")
+    if not isinstance(data, list) or not data:
+        return None
+    metric = data[0]
+    if not isinstance(metric, dict):
+        return None
+    total = metric.get("total_value")
+    if isinstance(total, dict) and isinstance(total.get("value"), (int, float)):
+        return float(total["value"])
+    values = metric.get("values")
+    if isinstance(values, list) and values:
+        value = values[-1].get("value") if isinstance(values[-1], dict) else None
+        if isinstance(value, (int, float)):
+            return float(value)
+    return None
+
+
+def collect_analytics(row: sqlite3.Row) -> None:
+    reel_id = int(row["id"])
+    media_id = str(row["media_id"] or "")
+    values: dict[str, Optional[float]] = {}
+    errors: list[str] = []
+    for column, metric in INSIGHT_METRICS.items():
+        try:
+            payload = graph_request("GET", f"{media_id}/insights", {"metric": metric}, timeout=45)
+            values[column] = parse_insight_value(payload)
+        except Exception as exc:
+            errors.append(f"{metric}: {short_error(exc, 160)}")
+    usable = {k: v for k, v in values.items() if v is not None}
+    conn = connect()
+    try:
+        attempts = int(row["analytics_attempts"] or 0) + 1
+        if usable:
+            conn.execute(
+                """
+                UPDATE reels SET analytics_collected_at=?, analytics_attempts=?, analytics_error=?,
+                  views=?, reach=?, likes=?, comments=?, shares=?, saved=?, follows=?,
+                  avg_watch_time=?, total_watch_time=?, updated_at=? WHERE id=?
+                """,
+                (
+                    iso(), attempts, " | ".join(errors)[:1200] if errors else None,
+                    int(usable["views"]) if "views" in usable else None,
+                    int(usable["reach"]) if "reach" in usable else None,
+                    int(usable["likes"]) if "likes" in usable else None,
+                    int(usable["comments"]) if "comments" in usable else None,
+                    int(usable["shares"]) if "shares" in usable else None,
+                    int(usable["saved"]) if "saved" in usable else None,
+                    int(usable["follows"]) if "follows" in usable else None,
+                    usable.get("avg_watch_time"), usable.get("total_watch_time"), iso(), reel_id,
+                ),
+            )
+            conn.commit()
+        else:
+            final = attempts >= 3
+            retry_at = now_utc() + dt.timedelta(hours=ANALYTICS_RETRY_HOURS)
+            conn.execute(
+                """
+                UPDATE reels SET analytics_attempts=?, analytics_error=?, analytics_next_retry_at=?,
+                  analytics_collected_at=?, updated_at=? WHERE id=?
+                """,
+                (attempts, " | ".join(errors)[:1200], iso(retry_at), iso() if final else None, iso(), reel_id),
+            )
+            conn.commit()
+    finally:
+        conn.close()
+
+    if usable:
+        lines = [
+            "72-HOUR REEL ANALYTICS",
+            f"Reel ID: {reel_id}",
+            f"File: {row['filename']}",
+            f"Caption mode: {row['caption_strategy']}",
+            f"Hashtags: {row['hashtag_pack']}",
+        ]
+        for key in ("views", "reach", "likes", "comments", "shares", "saved", "follows", "avg_watch_time", "total_watch_time"):
+            if key in usable:
+                label = key.replace("_", " ").title()
+                value = usable[key]
+                lines.append(f"{label}: {int(value) if float(value).is_integer() else round(value, 2)}")
+        if row["permalink"]:
+            lines.append(str(row["permalink"]))
+        send_message("\n".join(lines))
+        log_event("analytics", "COLLECTED", reel_id, f"metrics={','.join(usable.keys())}")
+    else:
+        send_message(
+            "72-HOUR ANALYTICS FAILED\n"
+            f"Reel ID: {reel_id}\nFile: {row['filename']}\n"
+            f"Attempt: {int(row['analytics_attempts'] or 0)+1}/3\n"
+            "The Reel remains posted; only the Insights fetch failed."
+        )
+        log_event("analytics", "FAILED", reel_id, " | ".join(errors))
+
+
+def due_analytics_rows(limit: int = 2) -> list[sqlite3.Row]:
+    now = iso()
+    conn = connect()
+    try:
+        return conn.execute(
+            """
+            SELECT * FROM reels
+            WHERE status='POSTED' AND media_id IS NOT NULL
+              AND analytics_due_at IS NOT NULL AND analytics_due_at <= ?
+              AND analytics_collected_at IS NULL
+              AND (analytics_next_retry_at IS NULL OR analytics_next_retry_at <= ?)
+            ORDER BY analytics_due_at ASC LIMIT ?
+            """,
+            (now, now, limit),
+        ).fetchall()
+    finally:
+        conn.close()
+
+
+# ----------------------------- Telegram -----------------------------
+def tg_api(method: str, *, data: Optional[dict[str, Any]] = None, files: Any = None, timeout: int = 35) -> dict[str, Any]:
+    if not TELEGRAM_BOT_TOKEN:
+        return {}
+    url = f"https://api.telegram.org/bot{TELEGRAM_BOT_TOKEN}/{method}"
+    try:
+        response = requests.post(url, data=data or {}, files=files, timeout=timeout)
+        payload = response.json()
+    except Exception as exc:
+        LOG.warning("Telegram %s failed: %s", method, short_error(exc))
+        return {}
+    if not payload.get("ok"):
+        LOG.warning("Telegram %s error: %s", method, short_error(payload))
+    return payload
+
+
+def send_message(text: str, reply_markup: Optional[dict[str, Any]] = None) -> None:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_OWNER_ID:
+        LOG.info("Telegram unavailable; message=%s", text[:300])
+        return
+    data: dict[str, Any] = {"chat_id": TELEGRAM_OWNER_ID, "text": text[:4090], "disable_web_page_preview": "true"}
+    if reply_markup:
+        data["reply_markup"] = json.dumps(reply_markup)
+    tg_api("sendMessage", data=data)
+
+
+def send_document(path: Path, caption: str) -> bool:
+    if not TELEGRAM_BOT_TOKEN or not TELEGRAM_OWNER_ID:
+        return False
+    with path.open("rb") as handle:
+        result = tg_api(
+            "sendDocument",
+            data={"chat_id": TELEGRAM_OWNER_ID, "caption": caption[:1000]},
+            files={"document": (path.name, handle, "application/zip")},
+            timeout=120,
+        )
+    return bool(result.get("ok"))
+
+
+def button(text: str, callback: str) -> dict[str, str]:
+    return {"text": text, "callback_data": callback}
+
+
+def root_menu() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [button("Posting", "menu:posting"), button("Queue", "menu:queue")],
+            [button("Analytics", "menu:analytics"), button("System", "menu:system")],
+            [button("Backup", "menu:backup")],
+        ]
+    }
+
+
+def posting_menu() -> dict[str, Any]:
+    pause_button = button("Resume", "act:resume") if is_paused() else button("Pause", "act:pause")
+    return {
+        "inline_keyboard": [
+            [button("Post Now", "confirm:postnow"), pause_button],
+            [button("Next Reel", "show:next"), button("Status", "show:status")],
+            [button("Back", "menu:root")],
+        ]
+    }
+
+
+def queue_menu() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [button("Queue", "show:queue"), button("Failed", "show:failed")],
+            [button("Skipped", "show:skipped"), button("Uncertain", "show:uncertain")],
+            [button("Skip Next", "confirm:skipnext"), button("Rescan Drive", "confirm:rescan")],
+            [button("Back", "menu:root")],
+        ]
+    }
+
+
+def analytics_menu() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [button("Stats", "show:stats"), button("Top Reels", "show:top")],
+            [button("Back", "menu:root")],
+        ]
+    }
+
+
+def system_menu() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [button("Config", "show:config"), button("Health", "show:health")],
+            [button("Logs", "show:logs"), button("Today", "show:logs_today")],
+            [button("Posted", "show:logs_posted"), button("Failed", "show:logs_failed")],
+            [button("Errors", "show:logs_errors"), button("Uncertain", "show:logs_uncertain")],
+            [button("Back", "menu:root")],
+        ]
+    }
+
+
+def backup_menu() -> dict[str, Any]:
+    return {
+        "inline_keyboard": [
+            [button("Backup Now", "confirm:backup"), button("Backup Status", "show:backup_status")],
+            [button("Back", "menu:root")],
+        ]
+    }
+
+
+def confirm_menu(action: str) -> dict[str, Any]:
+    return {"inline_keyboard": [[button("Confirm", f"do:{action}"), button("Cancel", "menu:root")]]}
+
+
+def status_text() -> str:
+    next_time = next_scheduled_time()
+    next_row = get_next_reel()
+    return (
+        f"{APP_NAME}\n"
+        f"Version: {APP_VERSION}\n"
