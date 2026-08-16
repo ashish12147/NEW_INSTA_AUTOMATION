@@ -1,0 +1,250 @@
+        f"State: {'SAFE HALT' if SAFE_HALT_REASON else ('PAUSED' if is_paused() else 'RUNNING')}\n"
+        f"Posting job: {'BUSY' if POST_LOCK.locked() else 'IDLE'}\n"
+        f"Schedule: {', '.join(POST_TIMES)} IST\n"
+        f"Next run: {next_time.strftime('%d %b %Y, %I:%M %p IST') if next_time else 'PAUSED'}\n"
+        f"Next Reel: {('#'+str(next_row['id'])+' '+str(next_row['filename'])) if next_row else 'NONE'}"
+    )
+
+
+def next_text() -> str:
+    row = get_next_reel()
+    if not row:
+        return "NEXT REEL\nNo pending Reel remains."
+    return (
+        "NEXT REEL\n"
+        f"ID: {row['id']}\n"
+        f"Folder: {row['folder_path']}\n"
+        f"File: {row['filename']}\n"
+        f"Queue position: {row['order_index']}\n"
+        f"Attempts used: {row['attempts']}/{MAX_ATTEMPTS}\n"
+        f"Caption mode: {row['caption_strategy']}\n"
+        f"Hashtag pack: {row['hashtag_pack']}"
+    )
+
+
+def queue_text(limit: int = 12) -> str:
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT id,folder_path,filename,attempts FROM reels WHERE status='PENDING' ORDER BY order_index LIMIT ?",
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return "QUEUE\nNo pending Reels."
+    lines = ["NEXT IN QUEUE"]
+    for row in rows:
+        lines.append(f"#{row['id']} | {row['folder_path']} / {row['filename']} | attempts {row['attempts']}/{MAX_ATTEMPTS}")
+    return "\n".join(lines)
+
+
+def list_status_text(status: str, limit: int = 20) -> str:
+    conn = connect()
+    try:
+        rows = conn.execute(
+            "SELECT id,folder_path,filename,attempts,last_error FROM reels WHERE status=? ORDER BY order_index LIMIT ?",
+            (status.upper(), limit),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return f"{status.upper()} REELS\nNone."
+    lines = [f"{status.upper()} REELS"]
+    for row in rows:
+        lines.append(f"#{row['id']} | {row['folder_path']} / {row['filename']} | attempts={row['attempts']}")
+        if row["last_error"]:
+            lines.append("  " + str(row["last_error"])[:180])
+    return "\n".join(lines)
+
+
+def history_text(limit: int = 15) -> str:
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id,status,filename,posted_at,last_attempt_at,permalink FROM reels
+            WHERE status IN ('POSTED','FAILED','SKIPPED','UNCERTAIN')
+            ORDER BY COALESCE(posted_at,last_attempt_at,updated_at) DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return "HISTORY\nNo completed items yet."
+    lines = ["RECENT HISTORY"]
+    for row in rows:
+        when = str(row["posted_at"] or row["last_attempt_at"] or "").replace("T", " ")[:19]
+        lines.append(f"#{row['id']} | {row['status']} | {row['filename']} | {when}")
+        if row["permalink"]:
+            lines.append(str(row["permalink"]))
+    return "\n".join(lines)
+
+
+def stats_text() -> str:
+    conn = connect()
+    try:
+        counts = {row["status"]: int(row["n"]) for row in conn.execute("SELECT status,COUNT(*) n FROM reels GROUP BY status")}
+        total = int(conn.execute("SELECT COUNT(*) FROM reels").fetchone()[0])
+        next_row = conn.execute("SELECT folder_path FROM reels WHERE status='PENDING' ORDER BY order_index LIMIT 1").fetchone()
+        folders_total = int(conn.execute("SELECT COUNT(DISTINCT folder_path) FROM reels").fetchone()[0])
+        folders_done = int(conn.execute(
+            """
+            SELECT COUNT(*) FROM (
+              SELECT folder_path FROM reels GROUP BY folder_path
+              HAVING SUM(CASE WHEN status='PENDING' OR status IN ('PROCESSING','PUBLISHING') THEN 1 ELSE 0 END)=0
+            )
+            """
+        ).fetchone()[0])
+    finally:
+        conn.close()
+    pending = counts.get("PENDING", 0)
+    days = pending / 2 if pending else 0
+    return (
+        "AUTOMATION STATS\n"
+        f"Total inventory: {total}\n"
+        f"Posted: {counts.get('POSTED',0)}\n"
+        f"Pending: {pending}\n"
+        f"Failed: {counts.get('FAILED',0)}\n"
+        f"Skipped: {counts.get('SKIPPED',0)}\n"
+        f"Uncertain: {counts.get('UNCERTAIN',0)}\n"
+        f"Current folder: {next_row['folder_path'] if next_row else 'COMPLETE'}\n"
+        f"Folders complete: {folders_done}/{folders_total}\n"
+        f"Estimated content remaining: {days:.1f} days at 2/day"
+    )
+
+
+def top_text(limit: int = 10) -> str:
+    conn = connect()
+    try:
+        rows = conn.execute(
+            """
+            SELECT id,filename,views,shares,saved,likes,caption_strategy,hashtag_pack,permalink
+            FROM reels WHERE analytics_collected_at IS NOT NULL AND views IS NOT NULL
+            ORDER BY views DESC, shares DESC LIMIT ?
+            """,
+            (limit,),
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return "TOP REELS\nNo 72-hour analytics snapshots are available yet."
+    lines = ["TOP REELS — 72H VIEWS"]
+    for i, row in enumerate(rows, 1):
+        lines.append(
+            f"{i}. #{row['id']} {row['filename']} — {row['views']} views | "
+            f"shares={row['shares'] if row['shares'] is not None else '-'} | {row['caption_strategy']} / {row['hashtag_pack']}"
+        )
+    return "\n".join(lines)
+
+
+def config_text() -> str:
+    conn = connect()
+    try:
+        next_row = conn.execute("SELECT folder_path,order_index FROM reels WHERE status='PENDING' ORDER BY order_index LIMIT 1").fetchone()
+    finally:
+        conn.close()
+    return (
+        "CONFIG — READ ONLY\n"
+        "Instagram: @44.o0\n"
+        f"Instagram user ID: {INSTAGRAM_USER_ID}\n"
+        f"Drive folder ID: {DRIVE_FOLDER_ID}\n"
+        f"Post times: {', '.join(POST_TIMES)} IST\n"
+        "Posts/day: 2\n"
+        f"Current folder: {next_row['folder_path'] if next_row else 'COMPLETE'}\n"
+        f"Retry limit: {MAX_ATTEMPTS}\n"
+        "Caption rotation: MEME → WEIRD → MEME → ENGAGEMENT → WEIRD\n"
+        f"Backup interval: {BACKUP_INTERVAL_HOURS} hours\n"
+        f"Analytics delay: {ANALYTICS_DELAY_HOURS} hours\n"
+        "Accepted files: MP4, MOV\n"
+        "Auto-rescan: OFF\n"
+        f"API: {API_VERSION}\n"
+        f"Share to feed: {'YES' if SHARE_TO_FEED else 'NO'}\n"
+        f"Volume data dir: {DATA_DIR}\n"
+        f"Public base URL: {PUBLIC_BASE_URL or 'NOT SET'}"
+    )
+
+
+def health_text() -> str:
+    try:
+        conn = connect()
+        check = conn.execute("PRAGMA quick_check").fetchone()[0]
+        total = conn.execute("SELECT COUNT(*) FROM reels").fetchone()[0]
+        conn.close()
+    except Exception as exc:
+        check, total = f"ERROR: {short_error(exc)}", "?"
+    return (
+        "HEALTH\n"
+        f"State: {'SAFE HALT' if SAFE_HALT_REASON else 'OK'}\n"
+        f"Database: {check}\n"
+        f"Inventory rows: {total}\n"
+        f"Posting lock: {'BUSY' if POST_LOCK.locked() else 'FREE'}\n"
+        f"Public URL: {'SET' if PUBLIC_BASE_URL else 'MISSING'}\n"
+        f"Safe halt reason: {SAFE_HALT_REASON or 'None'}"
+    )
+
+
+def logs_text(mode: str = "all", limit: int = 30) -> str:
+    conn = connect()
+    try:
+        params: list[Any] = []
+        where = "1=1"
+        if mode == "today":
+            start = dt.datetime.combine(now_local().date(), dt.time.min, TZ).astimezone(dt.timezone.utc)
+            where = "created_at>=?"
+            params.append(iso(start))
+        elif mode in {"posted", "failed", "uncertain"}:
+            where = "status=?"
+            params.append(mode.upper())
+        elif mode == "errors":
+            where = "status IN ('ERROR','FAILED','UNCERTAIN')"
+        params.append(limit)
+        rows = conn.execute(
+            f"SELECT event_type,status,reel_id,detail,created_at FROM events WHERE {where} ORDER BY id DESC LIMIT ?",
+            params,
+        ).fetchall()
+    finally:
+        conn.close()
+    if not rows:
+        return f"LOGS — {mode.upper()}\nNo matching events."
+    lines = [f"LOGS — {mode.upper()}"]
+    for row in reversed(rows):
+        when = str(row["created_at"]).replace("T", " ")[:19]
+        lines.append(f"{when} | {row['event_type']} | {row['status']} | reel={row['reel_id'] or '-'}")
+        if row["detail"]:
+            lines.append("  " + str(row["detail"])[:220])
+    return "\n".join(lines)[-4050:]
+
+
+def skip_reel(reel_id: Optional[int] = None) -> str:
+    conn = connect()
+    try:
+        if reel_id is None:
+            row = conn.execute("SELECT * FROM reels WHERE status='PENDING' ORDER BY order_index LIMIT 1").fetchone()
+        else:
+            row = conn.execute("SELECT * FROM reels WHERE id=?", (reel_id,)).fetchone()
+        if not row:
+            return "Nothing to skip."
+        if str(row["status"]) != "PENDING":
+            return f"Reel #{row['id']} is {row['status']}, not PENDING."
+        conn.execute("UPDATE reels SET status='SKIPPED', updated_at=? WHERE id=?", (iso(), row["id"]))
+        conn.commit()
+    finally:
+        conn.close()
+    log_event("queue", "SKIPPED", int(row["id"]), f"{row['folder_path']}/{row['filename']}")
+    return f"SKIPPED\n#{row['id']} {row['folder_path']} / {row['filename']}"
+
+
+def unskip_reel(reel_id: int) -> str:
+    conn = connect()
+    try:
+        row = conn.execute("SELECT * FROM reels WHERE id=?", (reel_id,)).fetchone()
+        if not row:
+            return f"Reel #{reel_id} not found."
+        if str(row["status"]) != "SKIPPED":
+            return f"Reel #{reel_id} is {row['status']}, not SKIPPED."
+        conn.execute("UPDATE reels SET status='PENDING', updated_at=? WHERE id=?", (iso(), reel_id))
+        conn.commit()
+    finally:
+        conn.close()
